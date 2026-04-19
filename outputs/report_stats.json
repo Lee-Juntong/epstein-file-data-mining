@@ -1,0 +1,76 @@
+{
+  "generated_at_utc": "2026-04-19T11:40:52.534068+00:00",
+  "total_pdf_files_loaded": 175,
+  "method_a": {
+    "rows": 75,
+    "unique_pairs": 32,
+    "unique_entities": 33,
+    "unique_source_files": 14,
+    "source_file_coverage": 0.08,
+    "top_interactions": {
+      "met": 25,
+      "spoke": 16,
+      "traveled": 14,
+      "discussed": 4,
+      "arranged": 3,
+      "accompanied": 3,
+      "contacted": 3,
+      "invited": 3,
+      "called": 2,
+      "flew": 1
+    },
+    "evidence": {
+      "avg_mentions_per_row": 2.6,
+      "median_mentions_per_row": 2.0,
+      "singleton_rows": 37,
+      "singleton_rate": 0.493333
+    },
+    "graph": {
+      "nodes": 33,
+      "edges": 32,
+      "density": 0.060606,
+      "connected_components": 4,
+      "largest_component_size": 25,
+      "isolates": 0
+    }
+  },
+  "method_b": {
+    "rows": 498,
+    "unique_pairs": 132,
+    "unique_entities": 129,
+    "unique_source_files": 42,
+    "source_file_coverage": 0.24,
+    "top_interactions": {
+      "met": 102,
+      "traveled": 84,
+      "called": 83,
+      "discussed": 69,
+      "contacted": 31,
+      "spoke": 31,
+      "arranged": 28,
+      "visited": 22,
+      "invited": 18,
+      "flew": 15
+    },
+    "evidence": {
+      "avg_mentions_per_row": 6.072289,
+      "median_mentions_per_row": 4.0,
+      "singleton_rows": 152,
+      "singleton_rate": 0.305221
+    },
+    "graph": {
+      "nodes": 129,
+      "edges": 132,
+      "density": 0.015988,
+      "connected_components": 17,
+      "largest_component_size": 92,
+      "isolates": 0
+    }
+  },
+  "comparison": {
+    "pair_overlap_count": 11,
+    "pair_overlap_jaccard": 0.071895,
+    "pair_interaction_overlap_count": 15,
+    "pair_interaction_overlap_jaccard": 0.064655
+  }
+}
