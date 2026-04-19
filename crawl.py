@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import html
-import shutil
 import time
 from html.parser import HTMLParser
 from pathlib import Path
@@ -36,6 +35,10 @@ DEFAULT_BROWSER_PATHS = (
     r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
 )
+
+
+class NonPdfDownloadError(RuntimeError):
+    """Raised when a download request does not return a real PDF payload."""
 
 
 class AnchorHrefParser(HTMLParser):
@@ -296,14 +299,158 @@ def iter_download_jobs(links: Iterable[str], output_dir: Path) -> Iterable[tuple
         yield link, output_dir / filename
 
 
-def download_pdf(url: str, destination: Path, overwrite: bool, timeout: int = 120) -> str:
-    if destination.exists() and not overwrite:
+def bytes_look_like_pdf(payload: bytes) -> bool:
+    return len(payload) >= 5 and payload[:5] == b"%PDF-"
+
+
+def path_has_pdf_signature(path: Path) -> bool:
+    try:
+        with path.open("rb") as file_obj:
+            return file_obj.read(5) == b"%PDF-"
+    except OSError:
+        return False
+
+
+def looks_like_age_gate_html(payload: bytes) -> bool:
+    snippet = payload[:4096].decode("utf-8", errors="ignore").lower()
+    return "age-verify" in snippet and "18 years" in snippet
+
+
+class BrowserDownloadSession:
+    """Persistent browser-backed downloader used when direct HTTP gets age-gated."""
+
+    def __init__(self, *, headless: bool, browser_path: str | None) -> None:
+        self.headless = headless
+        self.browser_path = browser_path
+        self._playwright = None
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._age_verified = False
+
+    def start(self) -> "BrowserDownloadSession":
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception as exc:
+            raise RuntimeError(
+                "Playwright is not available. Install it with: python -m pip install playwright"
+            ) from exc
+
+        executable_path = find_browser_executable(self.browser_path)
+        launch_kwargs: dict[str, Any] = {"headless": self.headless}
+        if executable_path:
+            launch_kwargs["executable_path"] = executable_path
+
+        self._playwright = sync_playwright().start()
+        try:
+            self._browser = self._playwright.chromium.launch(**launch_kwargs)
+            self._context = self._browser.new_context()
+            self._page = self._context.new_page()
+            self._page.set_default_timeout(90_000)
+        except Exception:
+            self.close()
+            raise
+
+        return self
+
+    def close(self) -> None:
+        if self._context is not None:
+            self._context.close()
+            self._context = None
+        if self._browser is not None:
+            self._browser.close()
+            self._browser = None
+        if self._playwright is not None:
+            self._playwright.stop()
+            self._playwright = None
+        self._page = None
+        self._age_verified = False
+
+    def _ensure_age_verified(self, destination_url: str) -> None:
+        if self._page is None:
+            raise RuntimeError("Browser download session is not initialized.")
+        if self._age_verified:
+            return
+
+        self._page.goto(destination_url, wait_until="domcontentloaded")
+        if "age-verify" in self._page.url:
+            yes_button = self._page.locator("#age-button-yes")
+            if yes_button.count() == 0:
+                raise RuntimeError("Age verification page loaded, but Yes button was not found.")
+            yes_button.first.click()
+            self._page.wait_for_timeout(750)
+
+        self._age_verified = True
+
+    def fetch_pdf_bytes(self, url: str, timeout: int = 120) -> bytes:
+        if self._context is None:
+            raise RuntimeError("Browser download session is not initialized.")
+
+        self._ensure_age_verified(url)
+        response = self._context.request.get(url, headers=DOWNLOAD_HEADERS, timeout=timeout * 1000)
+        payload = response.body()
+        if bytes_look_like_pdf(payload):
+            return payload
+
+        # Retry once after reapplying age verification in case the cookie expired.
+        self._age_verified = False
+        self._ensure_age_verified(url)
+        response = self._context.request.get(url, headers=DOWNLOAD_HEADERS, timeout=timeout * 1000)
+        payload = response.body()
+        if bytes_look_like_pdf(payload):
+            return payload
+
+        content_type = response.headers.get("content-type", "")
+        if looks_like_age_gate_html(payload):
+            raise NonPdfDownloadError(
+                f"Browser request still returned age verification HTML for {url}."
+            )
+        raise NonPdfDownloadError(
+            f"Browser request returned non-PDF content-type={content_type!r} for {url}."
+        )
+
+
+def download_pdf_with_browser_session(
+    url: str,
+    destination: Path,
+    overwrite: bool,
+    browser_session: BrowserDownloadSession,
+    timeout: int = 120,
+) -> str:
+    if destination.exists() and not overwrite and path_has_pdf_signature(destination):
         return "skipped"
 
     destination.parent.mkdir(parents=True, exist_ok=True)
+    payload = browser_session.fetch_pdf_bytes(url, timeout=timeout)
+    with destination.open("wb") as file_obj:
+        file_obj.write(payload)
+    return "downloaded"
+
+
+def download_pdf(url: str, destination: Path, overwrite: bool, timeout: int = 120) -> str:
+    if destination.exists() and not overwrite:
+        if path_has_pdf_signature(destination):
+            return "skipped"
+        print(f"Existing file is not a valid PDF and will be re-downloaded: {destination.name}")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
     request = Request(url, headers=DOWNLOAD_HEADERS)
-    with urlopen(request, timeout=timeout) as response, destination.open("wb") as file_obj:
-        shutil.copyfileobj(response, file_obj)
+    with urlopen(request, timeout=timeout) as response:
+        payload = response.read()
+        content_type = response.headers.get("Content-Type", "")
+        final_url = response.geturl()
+
+    if not bytes_look_like_pdf(payload):
+        if looks_like_age_gate_html(payload):
+            raise NonPdfDownloadError(
+                f"Age verification HTML was returned (final URL: {final_url})."
+            )
+        raise NonPdfDownloadError(
+            f"Non-PDF response received (content-type={content_type!r}, final URL: {final_url})."
+        )
+
+    with destination.open("wb") as file_obj:
+        file_obj.write(payload)
     return "downloaded"
 
 
@@ -380,29 +527,75 @@ def main() -> int:
         return 0
 
     downloaded = 0
+    downloaded_via_browser_fallback = 0
     skipped = 0
     failed = 0
+    browser_fallback_disabled = False
+    browser_session: BrowserDownloadSession | None = None
 
     jobs = list(iter_download_jobs(links, output_dir))
     total = len(jobs)
-    for index, (url, destination) in enumerate(jobs, start=1):
-        try:
-            status = download_pdf(url, destination, overwrite=args.overwrite)
-            if status == "downloaded":
-                downloaded += 1
-                print(f"[{index}/{total}] downloaded {destination.name}")
-            else:
-                skipped += 1
-                print(f"[{index}/{total}] skipped {destination.name} (already exists)")
-        except (HTTPError, URLError, TimeoutError) as exc:
-            failed += 1
-            print(f"[{index}/{total}] failed {destination.name}: {exc}")
+    try:
+        for index, (url, destination) in enumerate(jobs, start=1):
+            try:
+                status = download_pdf(url, destination, overwrite=args.overwrite)
+                if status == "downloaded":
+                    downloaded += 1
+                    print(f"[{index}/{total}] downloaded {destination.name}")
+                else:
+                    skipped += 1
+                    print(f"[{index}/{total}] skipped {destination.name} (already exists)")
+            except NonPdfDownloadError as direct_exc:
+                if browser_fallback_disabled:
+                    failed += 1
+                    print(f"[{index}/{total}] failed {destination.name}: {direct_exc}")
+                    continue
 
-        if args.download_delay > 0 and index < total:
-            time.sleep(args.download_delay)
+                try:
+                    if browser_session is None:
+                        browser_session = BrowserDownloadSession(
+                            headless=args.headless,
+                            browser_path=args.browser_path,
+                        ).start()
+                        print("Direct download returned non-PDF content; browser fallback enabled.")
+
+                    status = download_pdf_with_browser_session(
+                        url,
+                        destination,
+                        overwrite=True,
+                        browser_session=browser_session,
+                        timeout=180,
+                    )
+                    if status == "downloaded":
+                        downloaded += 1
+                        downloaded_via_browser_fallback += 1
+                        print(f"[{index}/{total}] downloaded {destination.name} (browser fallback)")
+                    else:
+                        skipped += 1
+                        print(f"[{index}/{total}] skipped {destination.name} (already exists)")
+                except (HTTPError, URLError, TimeoutError, RuntimeError) as fallback_exc:
+                    if browser_session is None:
+                        browser_fallback_disabled = True
+                    failed += 1
+                    print(
+                        f"[{index}/{total}] failed {destination.name}: {direct_exc}; "
+                        f"browser fallback error: {fallback_exc}"
+                    )
+            except (HTTPError, URLError, TimeoutError) as exc:
+                failed += 1
+                print(f"[{index}/{total}] failed {destination.name}: {exc}")
+
+            if args.download_delay > 0 and index < total:
+                time.sleep(args.download_delay)
+    finally:
+        if browser_session is not None:
+            browser_session.close()
 
     print(
-        f"Done. total={total}, downloaded={downloaded}, skipped={skipped}, failed={failed}."
+        "Done. "
+        f"total={total}, downloaded={downloaded}, "
+        f"browser_fallback_downloaded={downloaded_via_browser_fallback}, "
+        f"skipped={skipped}, failed={failed}."
     )
     return 0 if failed == 0 else 2
 
